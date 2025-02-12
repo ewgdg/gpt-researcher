@@ -2,17 +2,23 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs
 import logging
 import hashlib
+import bs4
 
+# todo: use text similarity to get the most relevant images for images without dimensions
 def get_relevant_images(soup: BeautifulSoup, url: str) -> list:
     """Extract relevant images from the page"""
     image_urls = []
     
     try:
         # Find all img tags with src attribute
-        all_images = soup.find_all('img', src=True)
-        
+        all_images = soup.find_all("img", src=True)
+
         for img in all_images:
-            img_src = urljoin(url, img['src'])
+            if not img.has_attr("src"):
+                continue
+            img_src = img["src"]
+            if not img_src.startswith(("http://", "https://")):
+                img_src = urljoin(url, img["src"])
             if img_src.startswith(('http://', 'https://')):
                 score = 0
                 # Check for relevant classes
@@ -33,8 +39,10 @@ def get_relevant_images(soup: BeautifulSoup, url: str) -> list:
                             score = 0  # Lowest score
                         else:
                             continue  # Skip small images
-                
-                image_urls.append({'url': img_src, 'score': score})
+
+                image_urls.append(
+                    {"url": img_src, "desc": img.get("alt", ""), "score": score}
+                )
         
         # Sort images by score (highest first)
         sorted_images = sorted(image_urls, key=lambda x: x['score'], reverse=True)
