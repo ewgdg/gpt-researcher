@@ -1,4 +1,6 @@
+import requests
 from gpt_researcher.scraper.browser.browser import BrowserScraper
+from gpt_researcher.scraper.beautiful_soup.beautiful_soup import BeautifulSoupScraper
 from bs4 import BeautifulSoup
 import bs4
 import re
@@ -11,7 +13,15 @@ scrapper = BrowserScraper(
     "https://www.google.com"
 )
 
-text, images, title = scrapper.scrape()
+
+session = requests.Session()
+scrapper2 = BeautifulSoupScraper(
+    # "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/",
+    "https://www.google.com",
+    session=session,
+)
+
+text, images, title = scrapper2.scrape()
 print(text, "|", len(text), "|", images, "|", title)
 
 
