@@ -230,7 +230,7 @@ class BrowserScraper:
             return text, [], ""
         else:
             page_source = self.driver.execute_script(
-                "return document.documentElement.outerHTML"
+                "return document.documentElement.outerHTML;"
             )
             soup = BeautifulSoup(page_source, "lxml")
 
