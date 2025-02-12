@@ -229,14 +229,16 @@ class BrowserScraper:
             text = scrape_pdf_with_arxiv(doc_num)
             return text, [], ""
         else:
-            page_source = self.driver.execute_script("return document.outerHTML;")
+            page_source = self.driver.execute_script(
+                "return document.documentElement.outerHTML"
+            )
             soup = BeautifulSoup(page_source, "lxml")
 
             soup = clean_soup(soup)
 
             text = get_text_from_soup(soup)
             image_urls = get_relevant_images(soup, self.url)
-            title = extract_title(page_source)
+            title = extract_title(soup)
 
         return text, image_urls, title
 
