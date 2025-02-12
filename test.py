@@ -9,8 +9,8 @@ from gpt_researcher.scraper.utils import get_relevant_images, extract_title
 
 
 scrapper = BrowserScraper(
-    # "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/"
-    "https://www.google.com"
+    "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/"
+    # "https://www.google.com"
 )
 
 
@@ -21,7 +21,7 @@ scrapper2 = BeautifulSoupScraper(
     session=session,
 )
 
-text, images, title = scrapper2.scrape()
+text, images, title = scrapper.scrape()
 print(text, "|", len(text), "|", images, "|", title)
 
 
