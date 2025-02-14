@@ -55,7 +55,7 @@ class NoDriverScraper:
 
             await scroll_to_bottom()
             html = await page.get_content()
-            # await page.close()
+            await page.close()
             soup = BeautifulSoup(html, "lxml")
             clean_soup(soup)
             text = get_text_from_soup(soup)
