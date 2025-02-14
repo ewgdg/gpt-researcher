@@ -34,3 +34,4 @@ loguru
 # uncomment for testing
 # pytest
 # pytest-asyncio
+git+https://github.com/ewgdg/nodriver

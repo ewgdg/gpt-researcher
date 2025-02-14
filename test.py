@@ -1,6 +1,8 @@
 import requests
 from gpt_researcher.scraper.browser.browser import BrowserScraper
 from gpt_researcher.scraper.beautiful_soup.beautiful_soup import BeautifulSoupScraper
+from gpt_researcher.scraper.web_base_loader.web_base_loader import WebBaseLoaderScraper
+from gpt_researcher.scraper import NoDriverScraper
 from bs4 import BeautifulSoup
 import bs4
 import re
@@ -9,19 +11,30 @@ from gpt_researcher.scraper.utils import get_relevant_images, extract_title
 
 
 scrapper = BrowserScraper(
-    "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/"
-    # "https://www.google.com"
+    # "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/"
+    "https://quotes.toscrape.com/scroll"
 )
 
 
 session = requests.Session()
 scrapper2 = BeautifulSoupScraper(
     # "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/",
-    "https://www.google.com",
+    "https://quotes.toscrape.com/scroll",
     session=session,
 )
 
-text, images, title = scrapper.scrape()
+scrapper3 = WebBaseLoaderScraper(
+    # "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/",
+    "https://quotes.toscrape.com/scroll",
+    session=session,
+)
+
+scrapper4 = NoDriverScraper(
+    "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/",
+    # "https://quotes.toscrape.com/scroll"
+)
+
+text, images, title = scrapper4.scrape()
 print(text, "|", len(text), "|", images, "|", title)
 
 
