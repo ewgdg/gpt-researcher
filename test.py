@@ -10,10 +10,10 @@ from collections import OrderedDict
 from gpt_researcher.scraper.utils import get_relevant_images, extract_title
 
 
-scrapper = BrowserScraper(
-    # "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/"
-    "https://quotes.toscrape.com/scroll"
-)
+# scrapper = BrowserScraper(
+#     # "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/"
+#     "https://quotes.toscrape.com/scroll"
+# )
 
 
 session = requests.Session()
@@ -30,8 +30,9 @@ scrapper3 = WebBaseLoaderScraper(
 )
 
 scrapper4 = NoDriverScraper(
-    "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/",
-    # "https://quotes.toscrape.com/scroll"
+    # "https://www.reddit.com/r/bapccanada/comments/1imlftg/rtx_50_series_prices_readjusted_in_canada_little/",
+    # "https://quotes.toscrape.com/scroll",
+    "https://www.g2.com/products/jenkins/reviews?page=19",
 )
 
 text, images, title = scrapper4.scrape()
