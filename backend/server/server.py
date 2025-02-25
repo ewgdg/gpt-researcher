@@ -14,7 +14,7 @@ from backend.server.server_utils import (
     update_environment_variables, handle_file_upload, handle_file_deletion,
     execute_multi_agents, handle_websocket_communication
 )
-
+from backend.server.middleware.openai_middleware import router as openai_router
 
 from gpt_researcher.utils.logging_config import setup_research_logging
 
@@ -76,7 +76,8 @@ manager = WebSocketManager()
 # Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000"]
+    + os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -93,7 +94,7 @@ def startup_event():
     os.makedirs("outputs", exist_ok=True)
     app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
     os.makedirs(DOC_PATH, exist_ok=True)
-    
+
 
 # Routes
 
@@ -132,3 +133,6 @@ async def websocket_endpoint(websocket: WebSocket):
         await handle_websocket_communication(websocket, manager)
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
+
+# Include OpenAI-like API router with a different prefix
+app.include_router(openai_router, prefix="/openai/api")
