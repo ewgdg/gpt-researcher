@@ -4,7 +4,7 @@ import random
 import traceback
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
-from typing import Dict, cast, Tuple, List, Optional
+from typing import Dict, cast, Tuple, List
 import requests
 import zendriver
 import asyncio
@@ -18,6 +18,7 @@ class NoDriverScraper:
     browser_tasks: Dict[
         requests.Session | None, asyncio.Task["NoDriverScraper.Browser"]
     ] = {}
+    browser_throttler = asyncio.Semaphore(3)
 
     @staticmethod
     def get_domain(url: str) -> str:
@@ -41,7 +42,7 @@ class NoDriverScraper:
             self.allowed_requests_times = {}
             self.domain_semaphores: Dict[str, asyncio.Semaphore] = {}
             self.tab_mode = True
-            self.max_scroll_percent = 1000
+            self.max_scroll_percent = 500
 
         async def get(self, url: str) -> zendriver.Tab:
             self.processing_count += 1
@@ -66,7 +67,7 @@ class NoDriverScraper:
                 scroll_percent = random.randrange(46, 97)
                 total_scroll_percent += scroll_percent
                 await page.scroll_down(scroll_percent)
-                await page.wait()
+                await page.wait(2)
                 await page.sleep(random.uniform(0.23, 0.56))
 
                 if total_scroll_percent >= self.max_scroll_percent:
@@ -115,6 +116,7 @@ class NoDriverScraper:
     ) -> "NoDriverScraper.Browser":
 
         async def create_browser():
+            await cls.browser_throttler.acquire()
             config = zendriver.Config(
                 headless=headless,
                 browser_connection_timeout=3,
@@ -141,10 +143,13 @@ class NoDriverScraper:
     @classmethod
     async def stop_browser_if_necessary(cls, browser: Browser):
         if browser and browser.processing_count <= 0:
-            cls.browser_tasks.pop(browser.session, None)
-            await browser.driver.stop()
+            try:
+                cls.browser_tasks.pop(browser.session, None)
+                await browser.driver.stop()
+            finally:
+                cls.browser_throttler.release()
 
-    def __init__(self, url: str, session: Optional[requests.Session] = None):
+    def __init__(self, url: str, session: requests.Session | None = None):
         self.url = url
         self.session = session
         self.debug = False
@@ -158,14 +163,14 @@ class NoDriverScraper:
                 "",
             )
 
-        browser: Optional[NoDriverScraper.Browser] = None
-        page: Optional[zendriver.Tab] = None
+        browser: NoDriverScraper.Browser | None = None
+        page: zendriver.Tab | None = None
         try:
             browser = await self.get_browser(session=self.session)
             page = await browser.get(self.url)
-            await page.wait()
-            await page.sleep(random.uniform(2.5, 3.3))
-            await page.wait()
+            await page.wait(2)
+            await page.sleep(random.uniform(1, 2.3))
+            await page.wait(random.uniform(2, 3))
 
             await browser.scroll_page_to_bottom(page)
             html = await page.get_content()
