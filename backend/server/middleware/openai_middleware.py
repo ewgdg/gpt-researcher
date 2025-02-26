@@ -1,6 +1,16 @@
-from typing import List
+import asyncio
+import json
+import time
+from typing import List, Optional, cast
+import uuid
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from gpt_researcher.config.config import Config
+from gpt_researcher.utils.llm import get_llm
+
+from ..sse_websocket_adapter import SSEWebSocketAdapter
 
 router = APIRouter()
 
@@ -11,10 +21,24 @@ class Message(BaseModel):
 
 
 class ChatCompletionsRequest(BaseModel):
+    model: str
     messages: List[Message]
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 1.0
+    n: Optional[int] = 1
+    stream: Optional[bool] = False
+    stop: Optional[List[str]] = None
+    max_tokens: Optional[int] = None
+    presence_penalty: Optional[float] = 0
+    frequency_penalty: Optional[float] = 0
+    user: Optional[str] = None
 
 
 class ChatCompletionsResponse(BaseModel):
+    id: str
+    object: str
+    created: int
+    model: str
     choices: List[dict]
 
 
@@ -58,37 +82,102 @@ async def retrieve_model(model: str):
     }
     return response
 
+async def test_stream(response: SSEWebSocketAdapter):
+    await response.send_text("test1\n")
+    await asyncio.sleep(1)
+    await response.send_text("test2\n")
+    await asyncio.sleep(1)
+    await response.send_text("test3\n")
+    await asyncio.sleep(1)
+    await response.complete()
 
+
+async def test_gen():
+    for i in range(3):
+        yield f"data: test{i}\n\n"
+        await asyncio.sleep(1)
+
+
+from langchain.schema import HumanMessage, AIMessage, SystemMessage
+
+
+def convert_to_langchain_messages(messages):
+    langchain_messages = []
+    for message in messages:
+        if message.role == "user":
+            langchain_messages.append(HumanMessage(content=message.content))
+        elif message.role == "assistant":
+            langchain_messages.append(AIMessage(content=message.content))
+        elif message.role == "system":
+            langchain_messages.append(SystemMessage(content=message.content))
+        else:
+            raise ValueError(f"Unsupported role: {message.role}")
+    return langchain_messages
+
+
+cfg = Config()
 @router.post("/chat/completions", response_model=ChatCompletionsResponse)
 async def create_completion(request: ChatCompletionsRequest):
-    # Implement your logic to handle the request and generate a response
-    response = {
-        "id": "chatcmpl-123",
-        "object": "chat.completion",
-        "created": 1677652288,
-        "model": "gpt-4o-mini",
-        "system_fingerprint": "fp_44709d6fcb",
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "\n\nHello there, how may I assist you today?",
-                },
-                "logprobs": None,
-                "finish_reason": "stop",
-            }
-        ],
-        "service_tier": "default",
-        "usage": {
-            "prompt_tokens": 9,
-            "completion_tokens": 12,
-            "total_tokens": 21,
-            "completion_tokens_details": {
-                "reasoning_tokens": 0,
-                "accepted_prediction_tokens": 0,
-                "rejected_prediction_tokens": 0,
-            },
-        },
-    }
-    return response
+    print("testing")
+    print(request)
+    response_id = str(uuid.uuid4())
+    created_time = int(time.time())
+
+    if not request.stream:
+        smart_agent = get_llm(
+            llm_provider=cfg.smart_llm_provider,
+            model=cfg.smart_llm_model,
+            temperature=0.35,
+            max_tokens=cfg.smart_token_limit,  # type: ignore
+            **cfg.llm_kwargs,
+        )
+        response = await smart_agent.get_chat_response(
+            messages=convert_to_langchain_messages(request.messages), stream=False
+        )
+        # return the response not stream
+        json_data = {
+            "id": response_id,
+            "object": "chat.completion",
+            "created": created_time,
+            "model": "gpt-researcher",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": response,
+                    },
+                    "finish_reason": "stop",
+                    "index": 0,
+                }
+            ],
+        }
+        return json_data
+
+    # manager.start_sender()
+    is_first = True
+
+    def format_message(message: str) -> str:
+        nonlocal is_first
+        delta = {"content": message} if message else {}
+        if is_first and message:
+            delta["role"] = "assistant"
+            is_first = False
+        chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": "gpt-researcher",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": None if message else "stop",
+                }
+            ],
+        }
+        return json.dumps(chunk)
+
+    streaming_response = SSEWebSocketAdapter(format_message)
+    asyncio.create_task(test_stream(streaming_response))
+
+    return StreamingResponse(streaming_response, media_type="text/event-stream")
