@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from gpt_researcher.config.config import Config
 from gpt_researcher.utils.llm import get_llm
 
-from ..sse_websocket_adapter import SSEWebSocketAdapter
+from ..sse_websocket_adapter import FormatType, SSEWebSocketAdapter
 
 router = APIRouter()
 
@@ -154,14 +154,11 @@ async def create_completion(request: ChatCompletionsRequest):
         return json_data
 
     # manager.start_sender()
-    is_first = True
 
-    def format_message(message: str) -> str:
-        nonlocal is_first
+    def format_message(message: str, format_type: FormatType) -> str:
         delta = {"content": message} if message else {}
-        if is_first and message:
+        if format_type == "first":
             delta["role"] = "assistant"
-            is_first = False
         chunk = {
             "id": response_id,
             "object": "chat.completion.chunk",
@@ -171,7 +168,7 @@ async def create_completion(request: ChatCompletionsRequest):
                 {
                     "index": 0,
                     "delta": delta,
-                    "finish_reason": None if message else "stop",
+                    "finish_reason": "stop" if format_type == "last" else None,
                 }
             ],
         }
