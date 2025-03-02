@@ -1,40 +1,43 @@
+import json
 from fastapi import WebSocket
 from fastapi.responses import StreamingResponse
-from typing import AsyncGenerator, AsyncIterator, Callable, Any, Literal
+from typing import AsyncGenerator, AsyncIterator, Callable, Any, Literal, Protocol
 import asyncio
 
-FormatType = Literal["first", "last"] | None
+class WebSocketLike(Protocol):
+    async def send_text(self, message: str): ...
 
+    async def send_json(self, message: str): ...
 
-# define an interface for SocketLike objects
-class SocketLike:
-    async def send_text(self, message: str):
-        pass
+    async def close(self): ...
 
-    async def send_json(self, message: str):
-        pass
+EventPosition = Literal["first", "last", "middle"]
+MessageType = Literal["logs", "report", "chat", "text"]
 
-    async def complete(self):
-        pass
-
-class SSEWebSocketAdapter:
-    def __init__(self, formatter: Callable[[str, FormatType], str]):
+class SSEWebSocketAdapter(WebSocketLike):
+    def __init__(self, formatter: Callable[[str, EventPosition, MessageType], str]):
         self.queue = asyncio.Queue()
         self.completed = False  # Mimic WebSocket connection state
         self.formatter = formatter
         self.is_first = False
 
     async def send_text(self, message: str):
+        return await self._send_text(message, "text")
+
+    async def _send_text(self, message: str, message_type: MessageType):
         if self.completed:
             raise RuntimeError("connection is closed.")
-        format_type: FormatType = None
+        format_type: EventPosition = "middle"
         if self.is_first:
             format_type = "first"
             self.is_first = False
-        await self.queue.put(self.formatter(message, format_type))
+        await self.queue.put(self.formatter(message, format_type, message_type))
 
-    async def complete(self):
-        await self.queue.put(self.formatter("", "last"))
+    async def send_json(self, message: str):
+        data = json.loads(message)
+
+    async def close(self):
+        await self.queue.put(self.formatter("", "last", "text"))
         self.completed = True
 
     def __aiter__(self) -> AsyncIterator[str]:
@@ -49,5 +52,5 @@ class SSEWebSocketAdapter:
             message = await self.queue.get()
             return f"data: {message}\n\n"
         except asyncio.CancelledError:
-            await self.complete()
+            await self.close()
             raise

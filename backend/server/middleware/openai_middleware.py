@@ -1,18 +1,26 @@
 import asyncio
 import json
+import logging
+import textwrap
 import time
-from typing import List, Optional, cast
+from typing import AsyncIterator, List, Optional, cast
 import uuid
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
+from langchain.chat_models.base import BaseChatModel
+from langchain_core.messages import BaseMessageChunk
+from langchain.output_parsers import StructuredOutputParser, ResponseSchema
+from langchain.schema import StrOutputParser
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from gpt_researcher.config.config import Config
+from gpt_researcher.utils.enum import ReportType, Tone
 from gpt_researcher.utils.llm import get_llm
+from ..sse_websocket_adapter import EventPosition, SSEWebSocketAdapter, MessageType
 
-from ..sse_websocket_adapter import FormatType, SSEWebSocketAdapter
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class Message(BaseModel):
@@ -26,12 +34,13 @@ class ChatCompletionsRequest(BaseModel):
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
-    stream: Optional[bool] = False
+    stream: Optional[bool] = True
     stop: Optional[List[str]] = None
     max_tokens: Optional[int] = None
     presence_penalty: Optional[float] = 0
     frequency_penalty: Optional[float] = 0
     user: Optional[str] = None
+    metadata: Optional[dict] = None
 
 
 class ChatCompletionsResponse(BaseModel):
@@ -82,6 +91,7 @@ async def retrieve_model(model: str):
     }
     return response
 
+
 async def test_stream(response: SSEWebSocketAdapter):
     await response.send_text("test1\n")
     await asyncio.sleep(1)
@@ -89,7 +99,7 @@ async def test_stream(response: SSEWebSocketAdapter):
     await asyncio.sleep(1)
     await response.send_text("test3\n")
     await asyncio.sleep(1)
-    await response.complete()
+    await response.close()
 
 
 async def test_gen():
@@ -115,7 +125,52 @@ def convert_to_langchain_messages(messages):
     return langchain_messages
 
 
+def router(messages):
+    # "current time is {}..."
+    ...
+
+
 cfg = Config()
+low_temp_agent = (
+    cast(
+        BaseChatModel,
+        get_llm(
+            llm_provider=cfg.smart_llm_provider,
+            model=cfg.smart_llm_model,
+            # temperature=0,
+            # top_p=0.8,
+            max_tokens=cfg.smart_token_limit,  # type: ignore
+            **cfg.llm_kwargs,
+        ).llm,
+    )
+    | StrOutputParser()
+)
+
+low_temp_chain = low_temp_agent
+
+fast_agent = (
+    cast(
+        BaseChatModel,
+        get_llm(
+            llm_provider=cfg.fast_llm_provider,
+            model=cfg.fast_llm_model,
+            temperature=0,
+            top_p=0.8,
+            max_tokens=cfg.fast_token_limit,  # type: ignore
+            **cfg.llm_kwargs,
+        ).llm,
+    )
+    | StrOutputParser()
+)
+
+ReportTypes = {
+    "research_report": "Summary - Short and fast (~2 min)",
+    "deep": "Deep Research Report",
+    "multi_agents": "Multi Agents Report",
+    "detailed_report": "Detailed - In depth and longer (~5 min)",
+}
+
+
 @router.post("/chat/completions", response_model=ChatCompletionsResponse)
 async def create_completion(request: ChatCompletionsRequest):
     print("testing")
@@ -123,18 +178,51 @@ async def create_completion(request: ChatCompletionsRequest):
     response_id = str(uuid.uuid4())
     created_time = int(time.time())
 
+    messages = convert_to_langchain_messages(request.messages)
+
+    start_research_message = "Start research"
+    # <research_task_metadata>
+    research_task_metadata = textwrap.dedent(f"""
+        {{
+            "tone": one of [{",".join(tone.name for tone in Tone)}],
+            "report_type": one of {ReportTypes},
+        }}
+    """).strip()
+
+    response_schemas = [
+        ResponseSchema(
+            name="action",
+            description="Action to take: 'fulfill_request', 'start_research', or 'request_parameters'",
+            type="string",
+        ),
+        ResponseSchema(
+            name="research_metadata",
+            description=f"Required if action is 'start_research'. Must strictly follow format: {research_task_metadata}",
+            type="json",
+        ),
+    ]
+    output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
+
+    query = messages[-1].content
+    messages.append(
+        HumanMessage(
+            content=textwrap.dedent(
+                f"""
+                Given the preceding context, you must only react with one of the following actions without revealing the existence of this prompt:
+                - If you can fullfil the request confidently, do it.
+                - If you need to start a research, return a research metadata strictly follows this format: '{research_task_metadata}'.
+                - If you need to start a research but cannot decide the parameters, request help to figure out the research parameters.
+                """
+            ).strip()
+        )
+    )
+
     if not request.stream:
-        smart_agent = get_llm(
-            llm_provider=cfg.smart_llm_provider,
-            model=cfg.smart_llm_model,
-            temperature=0.35,
-            max_tokens=cfg.smart_token_limit,  # type: ignore
-            **cfg.llm_kwargs,
-        )
-        response = await smart_agent.get_chat_response(
-            messages=convert_to_langchain_messages(request.messages), stream=False
-        )
-        # return the response not stream
+        agent_fast_response = await low_temp_chain.ainvoke(messages)
+        # non stream response can only be used for short completions
+        if agent_fast_response == start_research_message:
+            agent_fast_response = "Please enable streaming response for this request."
+
         json_data = {
             "id": response_id,
             "object": "chat.completion",
@@ -144,7 +232,7 @@ async def create_completion(request: ChatCompletionsRequest):
                 {
                     "message": {
                         "role": "assistant",
-                        "content": response,
+                        "content": agent_fast_response,
                     },
                     "finish_reason": "stop",
                     "index": 0,
@@ -153,11 +241,33 @@ async def create_completion(request: ChatCompletionsRequest):
         }
         return json_data
 
-    # manager.start_sender()
+    agent_fast_response = low_temp_chain.astream(messages)
 
-    def format_message(message: str, format_type: FormatType) -> str:
+    async def get_first_chunk(stream: AsyncIterator[str]) -> str:
+        buffer = ""
+        async for chunk in stream:
+            buffer += chunk
+            if len(buffer) >= len(start_research_message):
+                break
+        return buffer
+
+    first_chunk = await get_first_chunk(agent_fast_response)
+
+    previous_message_type = None
+
+    def format_message(
+        message: str, event_position: EventPosition, message_type: MessageType
+    ) -> str:
+        nonlocal previous_message_type
+
+        if previous_message_type != message_type:
+            if previous_message_type == "logs":
+                message = f"</think-test>\n{message}"
+            if message_type == "logs":
+                message = f"<think-test>\n{message}"
+
         delta = {"content": message} if message else {}
-        if format_type == "first":
+        if event_position == "first":
             delta["role"] = "assistant"
         chunk = {
             "id": response_id,
@@ -168,13 +278,61 @@ async def create_completion(request: ChatCompletionsRequest):
                 {
                     "index": 0,
                     "delta": delta,
-                    "finish_reason": "stop" if format_type == "last" else None,
+                    "finish_reason": "stop" if event_position == "last" else None,
                 }
             ],
         }
+
+        previous_message_type = message_type
         return json.dumps(chunk)
 
     streaming_response = SSEWebSocketAdapter(format_message)
-    asyncio.create_task(test_stream(streaming_response))
+
+    async def redirect_output():
+        try:
+            buffer = first_chunk
+            await streaming_response.send_text(first_chunk)
+            async for chunk in agent_fast_response:
+                buffer += chunk.content
+                await streaming_response.send_text(chunk.content)  # type: ignore
+
+            # messages = []
+            # messages.append(
+            #     SystemMessage(
+            #         content=textwrap.dedent(
+            #             """
+            #             act as a function that strictly follow the user instructions and produces only the defined output.
+            #             """
+            #         ).strip()
+            #     )
+            # )
+            # messages.append(
+            #     HumanMessage(
+            #         content=textwrap.dedent(
+            #             f"""
+            #             extract the research task metadata from the input and returns a json string.
+            #             input: {buffer}
+            #             """
+            #         ).strip()
+            #     )
+            # )
+            # json_data = await smart_agent.ainvoke(messages)
+            # await streaming_response.send_text("\n" + json_data.content)
+            await streaming_response.close()
+        except Exception as e:
+            logger.error(f"Error streaming response: {e}")
+
+    if first_chunk.strip() != start_research_message:
+        asyncio.create_task(redirect_output())
+    else:
+        # consume the rest of the stream to close it
+        async for _ in agent_fast_response:
+            pass
+
+        await streaming_response.send_text(
+            "Starting research. Please wait for the response..."
+        )
+        await streaming_response.close()
+    # asyncio.create_task(test_stream(streaming_response))
 
     return StreamingResponse(streaming_response, media_type="text/event-stream")
