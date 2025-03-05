@@ -14,7 +14,7 @@ from backend.server.server_utils import (
     update_environment_variables, handle_file_upload, handle_file_deletion,
     execute_multi_agents, handle_websocket_communication
 )
-from backend.server.middleware.openai_middleware import router as openai_router
+from backend.server.openai.openai_middleware import router as openai_router
 
 from gpt_researcher.utils.logging_config import setup_research_logging
 
