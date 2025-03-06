@@ -68,7 +68,7 @@ class SSEWebSocketAdapter(WebSocketLike):
     async def close(self):
         if self.is_first:
             await self.send_text("Error: Connection closed before any data was sent.")
-        await self.complete("")
+        await self.complete("\n")
 
     async def get_full_message(self) -> str:
         sb = []

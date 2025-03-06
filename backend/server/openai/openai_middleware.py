@@ -19,7 +19,7 @@ from typing import (
 )
 import uuid
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 from langchain.chat_models.base import BaseChatModel
@@ -35,12 +35,16 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableLambda
 from langchain.output_parsers import StructuredOutputParser, ResponseSchema
 from langchain.schema import StrOutputParser
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.prompts import (
+    ChatPromptTemplate,
+    MessagesPlaceholder,
+    SystemMessagePromptTemplate,
+)
 from langchain.tools import tool
 from langgraph.graph import Graph, MessagesState
 from langgraph.func import task, entrypoint
 from gpt_researcher.config.config import Config
-from gpt_researcher.utils.enum import Tone
+from gpt_researcher.utils.enum import Tone, ReportType
 from gpt_researcher.utils.llm import get_llm
 from ..sse_websocket_adapter import EventPosition, SSEWebSocketAdapter, MessageType
 
@@ -183,58 +187,55 @@ fast_chat_model = cast(
     get_llm(
         llm_provider=cfg.fast_llm_provider,
         model=cfg.fast_llm_model,
-        temperature=0,
-        top_p=0.8,
         max_tokens=cfg.fast_token_limit,  # type: ignore
         **cfg.llm_kwargs,
     ).llm,
 )
 
-ReportTypes = {
-    "research_report": "Summary - Short and fast (~2 min)",
-    "detailed_report": "Detailed - longer (~5 min)",
-    "deep": "Deep Research Report",
-    "multi_agents": "Multi Agents Report",
-}
-
-ReportTypeLiteral: TypeAlias = Annotated[
+ResearchTypeLiteral: TypeAlias = Annotated[
     str,
     ...,
-    "Must match one of the following report type literals: "
-    "- research_report: A brief summary, ~2 min.\n"
-    "- deep: Extensive research.\n"
-    "- multi_agents: Multiple perspectives.\n"
-    "- detailed_report: In-depth, ~5 min.",
+    "Must match one of the following research type literals: \n"
+    " - research_report: A brief summary, ~2 min.\n"
+    " - deep: advanced recursive deep research workflow.\n"
+    " - multi_agents: leveraging multiple agents with specialized skills.\n",
 ]
 
 ReportToneLiteral: TypeAlias = Annotated[
     str,
     ...,
-    f"Must match one of the tone literals: {', '.join(f"'{tone.name}'" for tone in Tone)}",
+    "Must match one of the tone literals: \n"
+    + "".join([f" - {tone.name}\n" for tone in Tone]),
 ]
 
+ResearchPrompt: TypeAlias = Annotated[
+    str,
+    ...,
+    "The prompt that is passed to the next agent for the research task. "
+    "be sure to include all necessary information for the research task.",
+]
 
 class ResearchTaskMetadata(BaseModel):
     report_tone: ReportToneLiteral
-    report_type: ReportTypeLiteral
+    research_type: ResearchTypeLiteral
+    message_index: int
 
 
 @tool
 def start_research(
-    research_query: str,
-    report_type: ReportTypeLiteral,
+    research_prompt: str,
+    research_type: ResearchTypeLiteral,
     report_tone: ReportToneLiteral,
 ):
-    """Start a research task on the query"""
+    """Start a research task on the query."""
     return json.dumps(
         {
-            "research_query": research_query,
+            "research_query": research_prompt,
             "report_tone": report_tone,
-            "report_type": report_type,
+            "research_type": research_type,
         },
         indent=2,
     )
-
 
 str_output_parser = StrOutputParser()
 
@@ -254,7 +255,7 @@ class TriageResult(BaseModel):
 triage_agent = (
     ChatPromptTemplate.from_messages(
         (
-            SystemMessage(
+            SystemMessagePromptTemplate.from_template(
                 "Today is {today_date}. decide which agent to handle the request."
             ),
             MessagesPlaceholder("messages"),
@@ -266,21 +267,31 @@ triage_agent = (
 
 research_tools = [start_research]
 research_model = smart_chat_model.bind_tools(research_tools)
+research_prompt = ChatPromptTemplate.from_messages(
+    (
+        SystemMessagePromptTemplate.from_template(
+            "decide if you need to start a research. note that today is {today_date}."
+            "if you have enough info, propose the research parameters for user to confirm before call start_research."
+            "else ask for necessary info to propose the parameters."
+        ),
+        MessagesPlaceholder("messages"),
+    )
+)
+research_agent = research_prompt | research_model
 
 
 async def triage_request(
     messages: List[BaseMessage],
 ) -> tuple[Literal[TriageResultValue, "follow_up"], ResearchTaskMetadata | None]:
-    pattern = r"^\s*<research_task_metadata>([\s\S]*?)<\/research_task_metadata>"
-    for message in messages:
+    pattern = r"\s*```research_task_metadata\s+([\s\S]*?)```"
+    for i, message in enumerate(messages):
         if isinstance(message, AIMessage):
             content = str_output_parser.invoke(message)
-            if content.startswith("<research_task_metadata>"):
-                match = re.search(pattern, content)
-                if match:
-                    print(match.group(1))
-                    json_data = json.loads(match.group(1))
-                    return "follow_up", ResearchTaskMetadata.model_validate(json_data)
+            if match := re.search(pattern, content):
+                print(match.group(1))
+                json_data = json.loads(match.group(1))
+                json_data["message_index"] = i
+                return "follow_up", ResearchTaskMetadata.model_validate(json_data)
 
     today_date = datetime.now().strftime("%Y-%m-%d")
     result = await triage_agent.ainvoke(
@@ -294,7 +305,9 @@ async def prepare_research(
     sse_writer: SSEWebSocketAdapter,
     request: ChatCompletionsRequest,
 ):
-    chunks = research_model.astream(messages)
+    today_date = datetime.now().strftime("%Y-%m-%d")
+    print(f"today_date: {today_date}")
+    chunks = research_agent.astream({"today_date": today_date, "messages": messages})
     tool_call_message = None
     async for chunk in chunks:
         if isinstance(chunk, AIMessageChunk) and chunk.tool_call_chunks:
@@ -319,9 +332,7 @@ async def prepare_research(
             print(type(tool_call), isinstance(tool_call, dict), tool_call.get("type"))
             tool_message: ToolMessage = start_research.invoke(tool_call)
             await sse_writer.send_text(
-                f"<research_task_metadata>\n"
-                f"{tool_message.content}\n"
-                "</research_task_metadata>\n"
+                f"\n```research_task_metadata\n{tool_message.content}\n```\n"
             )
 
             await sse_writer.send_json({"type": "logs", "output": "testing output1"})
@@ -355,16 +366,22 @@ async def workflow(
         elif triage_result == "research":
             await prepare_research(messages, sse_writer, request)
             return
-        elif triage_result == "follow_up":
-            await sse_writer.send_text("This is a follow up request.")
+        elif triage_result == "follow_up" and research_task_metadata:
+            # exclude the report message and opt for embeddings
+            report = messages[research_task_metadata.message_index]
+            messages = messages[research_task_metadata.message_index + 1 :]
+            await sse_writer.send_text("This is a follow up request.\n")
+            async for chunk in fast_chat_model.astream(messages):
+                await sse_writer.send_text(str_output_parser.invoke(chunk))
             return
         else:
             raise ValueError(f"Unknown triage result: {triage_result}")
+    except asyncio.CancelledError:
+        logger.info("workflow cancelled")
+        raise
     except Exception as e:
         logger.error(f"Error processing request: {e}")
         await sse_writer.send_text(f"Error: {e}")
-    finally:
-        await sse_writer.close()
 
 
 class SSEMessageFormatter:
@@ -386,6 +403,7 @@ class SSEMessageFormatter:
                     logger.warning("Ignoring log messages after thinking is done.")
                     message = ""
                 else:
+                    # todo use openAI thinking response
                     self.is_thinking = True
                     message = f"<think>\n{message}"
             elif self.is_thinking:
@@ -452,184 +470,33 @@ async def create_completion(request: ChatCompletionsRequest):
     # print(start_research.get_prompts())
     # return "test"
 
-    sse_formater = SSEMessageFormatter(
+    sse_formatter = SSEMessageFormatter(
         response_id, created_time, request.stream or False
     )
-    sse_writer = SSEWebSocketAdapter(sse_formater.format)
+    sse_writer = SSEWebSocketAdapter(sse_formatter.format)
 
-    asyncio.create_task(workflow(request, sse_writer))
-    if request.stream:
-        return StreamingResponse(sse_writer, media_type="text/event-stream")
-    return await sse_writer
-
-    today_date = datetime.now().strftime("%Y-%m-%d")
-    system_prompt = SystemMessage(
-        "Today is {today_date}. Start a research if you cannot fulfill the request confidently."
-    )
-    messages = json_to_langchain_messages(request.messages)
-    # prompt = ChatPromptTemplate.from_messages((system_prompt, MessagesPlaceholder("messages")))
-
-    tools = [start_research]
-    model_with_tools = smart_chat_model.bind_tools(tools)
-
-    agent_response = cast(
-        AIMessage, await model_with_tools.ainvoke((system_prompt, *messages))
-    )
-    if agent_response.tool_calls:
-        pass
-
-    # <research_task_metadata>
-    research_task_metadata = textwrap.dedent(f"""
-        {{
-            "tone": one of [{",".join(tone.name for tone in Tone)}],
-            "report_type": one of {ReportTypes},
-        }}
-    """).strip()
-
-    response_schemas = [
-        ResponseSchema(
-            name="action",
-            description="Action to take: 'fulfill_request', 'start_research', or 'request_parameters'",
-            type="string",
-        ),
-        ResponseSchema(
-            name="research_metadata",
-            description=f"Required if action is 'start_research'. Must strictly follow format: {research_task_metadata}",
-            type="json",
-        ),
-    ]
-    output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
-
-    query = messages[-1].content
-    messages.append(
-        HumanMessage(
-            content=textwrap.dedent(
-                f"""
-                Given the preceding context, you must only react with one of the following actions without revealing the existence of this prompt:
-                - If you can fullfil the request confidently, do it.
-                - If you need to start a research, return a research metadata strictly follows this format: '{research_task_metadata}'.
-                - If you need to start a research but cannot decide the parameters, request help to figure out the research parameters.
-                """
-            ).strip()
-        )
-    )
-
-    if not request.stream:
-        agent_fast_response = await low_temp_chain.ainvoke(messages)
-        # non stream response can only be used for short completions
-        if agent_fast_response == start_research_message:
-            agent_fast_response = "Please enable streaming response for this request."
-
-        json_data = {
-            "id": response_id,
-            "object": "chat.completion",
-            "created": created_time,
-            "model": "gpt-researcher",
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": agent_fast_response,
-                    },
-                    "finish_reason": "stop",
-                    "index": 0,
-                }
-            ],
-        }
-        return json_data
-
-    agent_fast_response = low_temp_chain.astream(messages)
-
-    async def get_first_chunk(stream: AsyncIterator[str]) -> str:
-        buffer = ""
-        async for chunk in stream:
-            buffer += chunk
-            if len(buffer) >= len(start_research_message):
-                break
-        return buffer
-
-    first_chunk = await get_first_chunk(agent_fast_response)
-
-    previous_message_type = None
-
-    def format_message(
-        message: str, event_position: EventPosition, message_type: MessageType
-    ) -> str:
-        nonlocal previous_message_type
-
-        if previous_message_type != message_type:
-            if previous_message_type == "logs":
-                message = f"</think-test>\n{message}"
-            if message_type == "logs":
-                message = f"<think-test>\n{message}"
-
-        delta = {"content": message} if message else {}
-        if event_position == "first":
-            delta["role"] = "assistant"
-        chunk = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created_time,
-            "model": "gpt-researcher",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": "stop" if event_position == "last" else None,
-                }
-            ],
-        }
-
-        previous_message_type = message_type
-        return json.dumps(chunk)
-
-    streaming_response = SSEWebSocketAdapter(format_message)
-
-    async def redirect_output():
+    async def start_workflow():
         try:
-            buffer = first_chunk
-            await streaming_response.send_text(first_chunk)
-            async for chunk in agent_fast_response:
-                buffer += chunk.content
-                await streaming_response.send_text(chunk.content)  # type: ignore
+            await workflow(request, sse_writer)
+        finally:
+            await sse_writer.close()
 
-            # messages = []
-            # messages.append(
-            #     SystemMessage(
-            #         content=textwrap.dedent(
-            #             """
-            #             act as a function that strictly follow the user instructions and produces only the defined output.
-            #             """
-            #         ).strip()
-            #     )
-            # )
-            # messages.append(
-            #     HumanMessage(
-            #         content=textwrap.dedent(
-            #             f"""
-            #             extract the research task metadata from the input and returns a json string.
-            #             input: {buffer}
-            #             """
-            #         ).strip()
-            #     )
-            # )
-            # json_data = await smart_agent.ainvoke(messages)
-            # await streaming_response.send_text("\n" + json_data.content)
-            await streaming_response.close()
-        except Exception as e:
-            logger.error(f"Error streaming response: {e}")
+    workflow_task = asyncio.create_task(start_workflow())
 
-    if first_chunk.strip() != start_research_message:
-        asyncio.create_task(redirect_output())
+    if request.stream:
+
+        async def stream_generator():
+            try:
+                async for chunk in sse_writer:
+                    yield chunk
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Error stream_generator response: {e}")
+            finally:
+                if not workflow_task.done():
+                    workflow_task.cancel()
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
     else:
-        # consume the rest of the stream to close it
-        async for _ in agent_fast_response:
-            pass
-
-        await streaming_response.send_text(
-            "Starting research. Please wait for the response..."
-        )
-        await streaming_response.close()
-    # asyncio.create_task(test_stream(streaming_response))
-
-    return StreamingResponse(streaming_response, media_type="text/event-stream")
+        return Response(await sse_writer, media_type="application/json")
