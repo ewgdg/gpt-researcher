@@ -1,28 +1,33 @@
 import asyncio
 from datetime import datetime
+import inspect
 import itertools
 import json
 import logging
 import re
 import textwrap
 import time
+import traceback
 from typing import (
     Annotated,
     AsyncIterator,
+    Iterable,
     List,
     Literal,
+    NotRequired,
     Optional,
     Sequence,
     TypedDict,
     cast,
     TypeAlias,
 )
+import typing
 import uuid
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse, Response
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
-from langchain.chat_models.base import BaseChatModel
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     BaseMessageChunk,
     BaseMessage,
@@ -33,20 +38,37 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.runnables import RunnableLambda
-from langchain.output_parsers import StructuredOutputParser, ResponseSchema
-from langchain.schema import StrOutputParser
-from langchain.prompts import (
+from langchain_core.output_parsers import (
+    StrOutputParser,
+    PydanticToolsParser,
+    JsonOutputToolsParser,
+)
+from langchain_core.prompts import (
     ChatPromptTemplate,
     MessagesPlaceholder,
     SystemMessagePromptTemplate,
 )
-from langchain.tools import tool
+from langchain_core.tools import tool, InjectedToolArg
+from langchain_core.vectorstores import InMemoryVectorStore
+
 from langgraph.graph import Graph, MessagesState
 from langgraph.func import task, entrypoint
+
+from backend.chat.chat import ChatAgentWithMemory
+from backend.server.server_utils import get_file_path, run_research
+from backend.server.sse_websocket_adapter import (
+    EventPosition,
+    SseFormatter,
+    SseWebSocketAdapter,
+    MessageType,
+)
+from backend.server import websocket_manager
+
 from gpt_researcher.config.config import Config
-from gpt_researcher.utils.enum import Tone, ReportType
+from gpt_researcher.memory.embeddings import Memory
+from gpt_researcher.utils.enum import ReportSource, Tone, ReportType
 from gpt_researcher.utils.llm import get_llm
-from ..sse_websocket_adapter import EventPosition, SSEWebSocketAdapter, MessageType
+
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -80,7 +102,7 @@ def json_to_langchain_messages(messages: List[JsonMessage]) -> List[BaseMessage]
         elif message.role == "assistant":
             langchain_messages.append(AIMessage(content=message.content))
         elif message.role == "system":
-            # langchain_messages.append(SystemMessage(content=message.content))
+            # ignore system messages from the user
             pass
         else:
             raise ValueError(f"Unsupported role: {message.role}")
@@ -136,7 +158,7 @@ async def retrieve_model(model: str):
     return response
 
 
-async def test_stream(response: SSEWebSocketAdapter):
+async def test_stream(response: SseWebSocketAdapter):
     await response.send_text("test1\n")
     await asyncio.sleep(1)
     await response.send_text("test2\n")
@@ -177,6 +199,8 @@ smart_chat_model = cast(
     get_llm(
         llm_provider=cfg.smart_llm_provider,
         model=cfg.smart_llm_model,
+        temperature=0.5,
+        top_p=0.9,
         max_tokens=cfg.smart_token_limit,  # type: ignore
         **cfg.llm_kwargs,
     ).llm,
@@ -187,54 +211,116 @@ fast_chat_model = cast(
     get_llm(
         llm_provider=cfg.fast_llm_provider,
         model=cfg.fast_llm_model,
+        temperature=0.5,
         max_tokens=cfg.fast_token_limit,  # type: ignore
         **cfg.llm_kwargs,
     ).llm,
 )
 
-ResearchTypeLiteral: TypeAlias = Annotated[
-    str,
-    ...,
-    "Must match one of the following research type literals: \n"
-    " - research_report: A brief summary, ~2 min.\n"
-    " - deep: advanced recursive deep research workflow.\n"
-    " - multi_agents: leveraging multiple agents with specialized skills.\n",
-]
+# ResearchTypeLiteral: TypeAlias = Annotated[
+#     ReportType,
+#     ...,
+#     "Prefer one of following research types: \n"
+#     " - research_report: A brief summary, ~2 min.\n"
+#     " - deep: advanced recursive deep research workflow.\n"
+#     " - multi_agents: leveraging multiple agents with specialized skills.\n",
+# ]
 
-ReportToneLiteral: TypeAlias = Annotated[
-    str,
-    ...,
-    "Must match one of the tone literals: \n"
-    + "".join([f" - {tone.name}\n" for tone in Tone]),
-]
+# ReportToneLiteral: TypeAlias = Annotated[
+#     Tone,
+#     ...,
+#     "Prefer one of following report tones: \n"
+#     f" - {Tone.Analytical}\n"
+#     f" - {Tone.Speculative}\n"
+#     f" - {Tone.Critical}\n"
+#     f" - {Tone.Formal}\n"
+#     f" - {Tone.Objective}\n"
+#     f" - {Tone.Persuasive}\n",
+# ]
 
-ResearchPrompt: TypeAlias = Annotated[
-    str,
-    ...,
-    "The prompt that is passed to the next agent for the research task. "
-    "be sure to include all necessary information for the research task.",
-]
-
-class ResearchTaskMetadata(BaseModel):
-    report_tone: ReportToneLiteral
-    research_type: ResearchTypeLiteral
-    message_index: int
+# ResearchPrompt: TypeAlias = Annotated[
+#     str,
+#     ...,
+#     "The prompt that is passed to the next agent for the research task."
+#     "It should be the user input or a revised prompt based on the user input."
+#     "Include as much information as possible to get the best results.",
+# ]
 
 
-@tool
-def start_research(
-    research_prompt: str,
-    research_type: ResearchTypeLiteral,
-    report_tone: ReportToneLiteral,
-):
-    """Start a research task on the query."""
-    return json.dumps(
-        {
-            "research_query": research_prompt,
-            "report_tone": report_tone,
-            "research_type": research_type,
-        },
-        indent=2,
+class BaseResearchTaskMetaData(BaseModel):
+    """Base class for research task metadata."""
+
+    report_tone: Literal[
+        Tone.Analytical,
+        Tone.Speculative,
+        Tone.Critical,
+        Tone.Formal,
+        Tone.Objective,
+        Tone.Persuasive,
+    ] = Field(
+        description="Highly prefer one of following report tones: \n"
+        f" - {Tone.Analytical}\n"
+        f" - {Tone.Speculative}\n"
+        f" - {Tone.Critical}\n"
+    )
+    research_type: Literal[
+        ReportType.ResearchReport, ReportType.DeepResearch, ReportType.MultiAgents
+    ] = Field(
+        description="Highly prefer one of following research types: \n"
+        " - research_report: A brief summary, ~2 min.\n"
+        " - deep: advanced recursive deep research workflow.\n"
+        " - multi_agents: leveraging multiple agents with specialized skills.\n",
+    )
+    research_prompt: str = Field(
+        description="The prompt that is passed to the next agent for the research task."
+        "It should be the user input or a revised prompt based on the user input."
+        "Include as much information as possible to get the best results.",
+    )
+
+
+class ResearchTaskMetadata(BaseResearchTaskMetaData):
+    task_id: Annotated[int, InjectedToolArg]
+    task_name: str = Field(description="Should be in snake_case.")
+    message_index: int | None = Field(None, description="Injected parameter.")
+
+
+@tool  # (args_schema=BaseResearchTaskMetaData)
+async def propose_research_task(
+    metadata: BaseResearchTaskMetaData,
+    sse_writer: Annotated[SseWebSocketAdapter, InjectedToolArg],
+) -> None:
+    """Propose a research task to user."""
+    await sse_writer.send_text(
+        "Would you like to proceed with the proposed research task as outlined, or would you like me to provide more information or adjust the parameters?"
+    )
+    await sse_writer.send_text(
+        f"\n## Proposed Research Task\n{'\n'.join(f'  - **{k.replace("_", " ").title()}**: {v}' for k, v in metadata.model_dump().items())}\n"
+    )
+
+
+@tool  # (args_schema=ResearchTaskMetadata)
+async def start_research(
+    metadata: ResearchTaskMetadata,
+    sse_writer: Annotated[SseWebSocketAdapter, InjectedToolArg],
+) -> None:
+    """Start a research task."""
+    await sse_writer.send_text(
+        f"\n```research_task_metadata\n{metadata.model_dump_json(indent=2, exclude_none=True)}\n```\n"
+    )
+
+    await run_research(
+        websocket=sse_writer,
+        task=metadata.research_prompt,
+        report_type=metadata.research_type,
+        source_urls=[],
+        document_urls=["./my-docs"],
+        tone=metadata.report_tone.name,
+        headers={},
+        report_source=ReportSource.Web,
+        query_domains=[],
+        manager=websocket_manager,
+        task_id=metadata.task_id,
+        task_name=metadata.task_name,
     )
 
 str_output_parser = StrOutputParser()
@@ -265,14 +351,16 @@ triage_agent = (
     | RunnableLambda[TriageResult, TriageResultValue](lambda r: r.value)
 )
 
-research_tools = [start_research]
+research_tools = [propose_research_task, start_research]
+research_tools_parser = PydanticToolsParser(tools=research_tools)
 research_model = smart_chat_model.bind_tools(research_tools)
 research_prompt = ChatPromptTemplate.from_messages(
     (
         SystemMessagePromptTemplate.from_template(
-            "decide if you need to start a research. note that today is {today_date}."
-            "if you have enough info, propose the research parameters for user to confirm before call start_research."
-            "else ask for necessary info to propose the parameters."
+            "Decide if you need to start a research tool call. note that today is {today_date}."
+            "If you have enough info, propose a research task. always wait for user to confirm first."
+            "Else ask for necessary info to suggest the parameters."
+            "If user confirms, start the research task."
         ),
         MessagesPlaceholder("messages"),
     )
@@ -291,7 +379,7 @@ async def triage_request(
                 print(match.group(1))
                 json_data = json.loads(match.group(1))
                 json_data["message_index"] = i
-                return "follow_up", ResearchTaskMetadata.model_validate(json_data)
+                return "follow_up", ResearchTaskMetadata(**json_data)
 
     today_date = datetime.now().strftime("%Y-%m-%d")
     result = await triage_agent.ainvoke(
@@ -302,7 +390,7 @@ async def triage_request(
 
 async def prepare_research(
     messages: List[BaseMessage],
-    sse_writer: SSEWebSocketAdapter,
+    sse_writer: SseWebSocketAdapter,
     request: ChatCompletionsRequest,
 ):
     today_date = datetime.now().strftime("%Y-%m-%d")
@@ -321,40 +409,92 @@ async def prepare_research(
             if content:
                 await sse_writer.send_text(content)
     if tool_call_message:
-        print(tool_call_message.tool_calls)
         if not request.stream:
             await sse_writer.send_text(
                 "Please enable streaming response for this request."
             )
             return
-        tool_call = tool_call_message.tool_calls[0]
-        if tool_call["name"] == "start_research":
-            print(type(tool_call), isinstance(tool_call, dict), tool_call.get("type"))
-            tool_message: ToolMessage = start_research.invoke(tool_call)
-            await sse_writer.send_text(
-                f"\n```research_task_metadata\n{tool_message.content}\n```\n"
-            )
 
-            await sse_writer.send_json({"type": "logs", "output": "testing output1"})
+        # tool_call_data_list = research_tools_parser.invoke(tool_call_message)
+        # print("tool_call_data\n", type(tool_call_data_list), tool_call_data_list)
+        # return
+        # print("tool_call_message\n", type(tool_call_message), tool_call_message)
 
-            await sse_writer.send_json(
-                {
-                    "type": "report",
-                    "content": "test content2",
-                }
-            )
+        for tool_call in tool_call_message.tool_calls:
+            if tool_call["name"] == "propose_research_task":
+                tool_call["args"]["sse_writer"] = sse_writer
+                print("args\n", tool_call["args"])
+                # metadata = BaseResearchTaskMetaData.model_validate(tool_call["args"])
+                await propose_research_task.ainvoke(tool_call)
+            elif tool_call["name"] == "start_research":
+                tool_call["args"]["metadata"]["task_id"] = int(time.time())
+                tool_call["args"]["sse_writer"] = sse_writer
 
-            await sse_writer.send_json(
-                {
-                    "type": "logs",
-                    "output": "testing output3",
-                }
-            )
+                # metadata = ResearchTaskMetadata.model_validate(tool_call["args"])
+                print(
+                    "tool_call_test\n",
+                    type(tool_call),
+                    tool_call["args"],
+                )
+                await start_research.ainvoke(tool_call)
+            else:
+                raise ValueError(f"Unknown tool call: {tool_call['name']}")
+
+
+if not cfg.embedding_provider or not cfg.embedding_model:
+    raise ValueError("Embedding provider or model not found.")
+embedding = Memory(
+    cfg.embedding_provider, cfg.embedding_model, **cfg.embedding_kwargs
+).get_embeddings()
+
+
+async def followup_research(
+    messages: List[BaseMessage],
+    task_metadata: ResearchTaskMetadata,
+    sse_writer: SseWebSocketAdapter,
+):
+    vector_store_path = get_file_path(
+        task_metadata.task_id, task_metadata.task_name, "vector_store"
+    )
+
+    vector_store = None
+    if vector_store_path.exists():
+        try:
+            vector_store = InMemoryVectorStore.load(str(vector_store_path), embedding)
+            print(f"vector_store loaded. {vector_store_path}")
+        except Exception as e:
+            logger.error(f"Error loading vector store: {e}")
+
+    message_index = task_metadata.message_index
+    if not isinstance(message_index, int):
+        raise ValueError("message_index is required for follow up research.")
+
+    report = str_output_parser.invoke(messages[message_index])
+
+    followup_agent = ChatAgentWithMemory(
+        report=report,
+        config_path="default",
+        headers=None,
+        vector_store=vector_store,
+    )
+
+    if not vector_store:
+        vector_store = followup_agent.vector_store
+        if not vector_store:
+            raise ValueError("Vector store not found.")
+        # persist the vector store
+        vector_store.dump(str(vector_store_path))
+
+    messages_copy = messages.copy()
+    messages_copy[message_index] = AIMessage(
+        "Research is done. Report is added to the vector store."
+    )
+    await followup_agent.chat(messages_copy, sse_writer)
 
 
 async def workflow(
     request: ChatCompletionsRequest,
-    sse_writer: SSEWebSocketAdapter,
+    sse_writer: SseWebSocketAdapter,
 ):
     try:
         messages = json_to_langchain_messages(request.messages)
@@ -367,12 +507,7 @@ async def workflow(
             await prepare_research(messages, sse_writer, request)
             return
         elif triage_result == "follow_up" and research_task_metadata:
-            # exclude the report message and opt for embeddings
-            report = messages[research_task_metadata.message_index]
-            messages = messages[research_task_metadata.message_index + 1 :]
-            await sse_writer.send_text("This is a follow up request.\n")
-            async for chunk in fast_chat_model.astream(messages):
-                await sse_writer.send_text(str_output_parser.invoke(chunk))
+            await followup_research(messages, research_task_metadata, sse_writer)
             return
         else:
             raise ValueError(f"Unknown triage result: {triage_result}")
@@ -380,58 +515,96 @@ async def workflow(
         logger.info("workflow cancelled")
         raise
     except Exception as e:
-        logger.error(f"Error processing request: {e}")
+        logger.error(f"Error processing request: {e}\n{traceback.format_exc()}")
         await sse_writer.send_text(f"Error: {e}")
 
 
-class SSEMessageFormatter:
+class OpenAiResponseFormatter(SseFormatter):
+    think_tag_start = "\n<think>\n"
+    think_tag_end = "\n</think>\n"
+
     def __init__(self, response_id: str, created_time: int, stream: bool):
         self.response_id = response_id
         self.created_time = created_time
         self.stream = stream
-        self.previous_message_type = None
         self.thinking_done = False
-        self.is_thinking = False
+        self.was_thinking = False
+        self.messages: list[str] = []
+        self.position = EventPosition.NONE
 
-    def format_chunk(
-        self, message: str, event_position: EventPosition, message_type: MessageType
-    ) -> str:
-        if self.previous_message_type != message_type:
+    def add_message(
+        self, message: str, position: EventPosition, message_type: MessageType
+    ):
+        if self.stream:
+            is_thinking = False
             if message_type == "logs":
-                if self.thinking_done:
+                is_thinking = True
+
+            ignore_message = False
+            if self.thinking_done:
+                if is_thinking:
                     # thinking is done, ignore the message
-                    logger.warning("Ignoring log messages after thinking is done.")
-                    message = ""
-                else:
-                    # todo use openAI thinking response
-                    self.is_thinking = True
-                    message = f"<think>\n{message}"
-            elif self.is_thinking:
-                self.is_thinking = False
-                self.thinking_done = True
-                message = f"\n</think>\n{message}"
+                    logger.debug(
+                        f"Ignoring log messages after thinking is done: {message}"
+                    )
+                    ignore_message = True
+            else:
+                if is_thinking and not self.was_thinking:
+                    self.messages.append(self.think_tag_start)
 
-        delta = {"content": message} if message else {}
-        if event_position == "first":
-            delta["role"] = "assistant"
-        chunk = {
-            "id": self.response_id,
-            "object": "chat.completion.chunk",
-            "created": self.created_time,
-            "model": "gpt-researcher",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": "stop" if event_position == "last" else None,
-                }
-            ],
-        }
+                if not is_thinking and self.was_thinking:
+                    self.messages.append(self.think_tag_end)
+                    self.thinking_done = True
+            if not ignore_message:
+                self.messages.append(message)
+            self.was_thinking = is_thinking
+        else:
+            if message_type == "logs":
+                message = ""
+            self.messages.append(message)
 
-        self.previous_message_type = message_type
-        return json.dumps(chunk)
+        self.position |= position
 
-    def format_full_message(self, message: str) -> str:
+    def stream_response(self) -> Iterable[str]:
+        def build_chunk(message: str) -> str:
+            delta = {"content": message} if message else {}
+            if EventPosition.First in self.position:
+                delta["role"] = "assistant"
+                self.position &= ~EventPosition.First
+
+            if EventPosition.Last in self.position:
+                finish_reason = "stop"
+                self.position &= ~EventPosition.Last
+            else:
+                finish_reason = None
+            chunk = {
+                "id": self.response_id,
+                "object": "chat.completion.chunk",
+                "created": self.created_time,
+                "model": "gpt-researcher",
+                "choices": [
+                    {"index": 0, "delta": delta, "finish_reason": finish_reason}
+                ],
+            }
+            return json.dumps(chunk)
+
+        # need to separate reasoning tokens and regular messages
+        message_buffer = []
+        i = 0
+        while True:
+            if i >= len(self.messages):
+                break
+            try:
+                message = self.messages[i]
+                message_buffer.append(message)
+                if i == len(self.messages) - 1 or message == self.think_tag_end:
+                    yield build_chunk("".join(message_buffer))
+                    message_buffer.clear()
+            finally:
+                i += 1
+
+    def message_response(self) -> str:
+        message = "".join(self.messages)
         return json.dumps(
             {
                 "id": self.response_id,
@@ -451,13 +624,17 @@ class SSEMessageFormatter:
             }
         )
 
-    def format(
-        self, message: str, event_position: EventPosition, message_type: MessageType
-    ) -> str:
-        if not self.stream:
-            return self.format_full_message(message)
-        return self.format_chunk(message, event_position, message_type)
+    def on_response_generated(self):
+        self.messages.clear()
+        self.position = EventPosition.NONE
 
+    def generate_response(self) -> str | Sequence[str]:
+        if self.stream:
+            response = tuple(self.stream_response())
+        else:
+            response = self.message_response()
+        self.on_response_generated()
+        return response
 
 @router.post("/chat/completions", response_model=ChatCompletionsResponse)
 async def create_completion(request: ChatCompletionsRequest):
@@ -465,15 +642,58 @@ async def create_completion(request: ChatCompletionsRequest):
     print(request)
     response_id = str(uuid.uuid4())
     created_time = int(time.time())
-    # print(start_research.get_input_jsonschema())
+
+    # print("schema\n")
+    # print(start_research.tool_call_schema.model_json_schema())
+    # print(propose_research_task.tool_call_schema.model_json_schema())
+
+    # print(propose_research_task.get_input_jsonschema())
     # print(start_research.get_output_jsonschema())
     # print(start_research.get_prompts())
+    # print(ResearchTaskMetadata)
     # return "test"
 
-    sse_formatter = SSEMessageFormatter(
+    sse_formatter = OpenAiResponseFormatter(
         response_id, created_time, request.stream or False
     )
-    sse_writer = SSEWebSocketAdapter(sse_formatter.format)
+    sse_writer = SseWebSocketAdapter(sse_formatter)
+
+    async def test_workflow():
+        await sse_writer.send_json(
+            {"type": "logs", "content": "Starting the logs1...", "output": "outputing"}
+        )
+        await sse_writer.send_json(
+            {"type": "logs", "content": "Starting the logs2...", "output": "log2"}
+        )
+        await sse_writer.send_json(
+            {
+                "type": "report",
+                "content": "Starting the report 1",
+                "output": "output1",
+            }
+        )
+        await sse_writer.send_json(
+            {
+                "type": "report",
+                "content": "Starting the report 2",
+                "output": "outputing2",
+            }
+        )
+        await sse_writer.send_json({"type": "path", "output": "/test/filepath"})
+
+        await sse_writer.send_json(
+            {"type": "logs", "content": "Starting the logs3...", "output": "log3"}
+        )
+
+        await sse_writer.send_json(
+            {"type": "logs", "content": "Starting the logs4...", "output": "log4"}
+        )
+        await sse_writer.send_json({"type": "logs", "output": "log5"})
+        await sse_writer.send_json({"type": "logs", "output": "log6"})
+        await sse_writer.close()
+
+    # asyncio.create_task(test_workflow())
+    # return StreamingResponse(sse_writer, media_type="text/event-stream")
 
     async def start_workflow():
         try:
