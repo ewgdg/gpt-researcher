@@ -9,12 +9,6 @@ from typing import (
 )
 import asyncio
 
-class WebSocketLike(Protocol):
-    async def send_text(self, message: str): ...
-
-    async def send_json(self, data: dict): ...
-
-    async def close(self): ...
 
 class EventPosition(Flag):
     NONE = 0
@@ -32,12 +26,12 @@ class SseFormatter(Protocol):
     def generate_response(self) -> str | Sequence[str]: ...
 
 
-class SseWebSocketAdapter(WebSocketLike):
+class SseWebSocketAdapter:
     def __init__(self, formatter: SseFormatter):
         self.queue: asyncio.Queue[tuple[str, EventPosition, MessageType]] = (
             asyncio.Queue()
         )
-        self.completed = False  # Mimic WebSocket connection state
+        self.completed = False
         self.formatter = formatter
         self.is_first = True
 
@@ -116,15 +110,3 @@ class SseWebSocketAdapter(WebSocketLike):
 
     def __aiter__(self) -> AsyncIterator[str]:
         return self.stream()
-
-    # async def __anext__(self) -> str:
-    #     """Yield messages from the queue."""
-    #     try:
-    #         if self.completed and self.queue.empty():
-    #             raise StopAsyncIteration
-    #         message, position, message_type = await self.queue.get()
-    #         self.formatter.add_message(message, position, message_type)
-    #         return f"data: {self.formatter.generate_response()}\n\n"
-    #     except asyncio.CancelledError:
-    #         await self.close()
-    #         raise

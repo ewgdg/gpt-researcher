@@ -5,9 +5,8 @@ import re
 import time
 import shutil
 import traceback
-from typing import Awaitable, Dict, List, Any
+from typing import Awaitable, Dict, List, Any, Protocol
 from fastapi.responses import JSONResponse, FileResponse
-from backend.server.sse_websocket_adapter import WebSocketLike
 from gpt_researcher.document.document import DocumentLoader
 from gpt_researcher import GPTResearcher
 from backend.utils import write_md_to_pdf, write_md_to_word, write_text_to_md
@@ -19,6 +18,8 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+class WebSocketLike(Protocol):
+    async def send_json(self, data: dict): ...
 class CustomLogsHandler:
     """Custom handler to capture streaming logs from the research process"""
 
